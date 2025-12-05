@@ -1,0 +1,5 @@
+{
+  "name": "Our Safe Space P2P Chat",
+  "description": "A secure, peer-to-peer real-time chat application using WebRTC. Share the link to start chatting immediately.",
+  "requestFramePermissions": []
+}
