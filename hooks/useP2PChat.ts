@@ -2,8 +2,13 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { DataConnection } from 'peerjs';
 import { Message, NetworkPayload, PeerState } from '../types';
 
-// Helper to generate a random ID if one doesn't exist
-const generateId = () => Math.random().toString(36).substr(2, 9);
+// Generate a simpler, friendly room ID if none exists
+const generateRoomId = () => {
+  const adjs = ['cozy', 'warm', 'safe', 'calm', 'soft'];
+  const nouns = ['nook', 'space', 'place', 'room', 'den'];
+  const random = Math.floor(Math.random() * 1000);
+  return `${adjs[Math.floor(Math.random() * adjs.length)]}-${nouns[Math.floor(Math.random() * nouns.length)]}-${random}`;
+};
 
 export const useP2PChat = () => {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -17,6 +22,7 @@ export const useP2PChat = () => {
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<{ [key: string]: DataConnection }>({});
   const processedMessageIds = useRef<Set<string>>(new Set());
+  const isHostRef = useRef(false);
 
   // Add message to local state
   const addMessage = useCallback((msg: Message) => {
@@ -26,12 +32,13 @@ export const useP2PChat = () => {
     setMessages((prev) => [...prev, msg]);
   }, []);
 
-  // Send data to specific connection or broadcast to all
+  // Send data helper
   const sendData = useCallback((data: NetworkPayload, targetConn?: DataConnection) => {
     if (targetConn) {
       targetConn.send(data);
     } else {
-      Object.values(connectionsRef.current).forEach((conn) => {
+      Object.values(connectionsRef.current).forEach((c) => {
+        const conn = c as DataConnection;
         if (conn.open) {
           conn.send(data);
         }
@@ -39,116 +46,134 @@ export const useP2PChat = () => {
     }
   }, []);
 
-  // Initialize Peer
+  const handleData = useCallback((data: unknown, sourcePeerId: string) => {
+    const payload = data as NetworkPayload;
+      
+    if (payload.type === 'CHAT_MESSAGE') {
+      const msg = payload.payload as Message;
+      
+      // Prevent duplicate processing
+      if (processedMessageIds.current.has(msg.id)) return;
+      
+      addMessage({ ...msg, isSelf: false });
+
+      // If Host, relay to others
+      if (isHostRef.current) {
+         Object.values(connectionsRef.current).forEach(c => {
+           const conn = c as DataConnection;
+           if (conn.peer !== sourcePeerId && conn.open) {
+             conn.send(payload);
+           }
+         });
+      }
+    }
+  }, [addMessage]);
+
   useEffect(() => {
-    // Check for existing room ID in hash
-    const hash = window.location.hash.replace('#', '');
-    const isHost = !hash;
-    
-    // If Host: Generate ID. If Guest: Use random ID, but connect to Hash ID.
-    const myId = isHost ? generateId() : generateId(); 
-    
-    // If hosting, set the hash so others can join
-    if (isHost) {
-      window.location.hash = myId;
+    // 1. Get or Create Room ID
+    let roomId = window.location.hash.replace('#', '');
+    if (!roomId) {
+      roomId = generateRoomId();
+      window.location.hash = roomId;
     }
 
-    const peer = new Peer(myId, {
+    console.log(`Attempting to join/host room: ${roomId}`);
+
+    // 2. Try to be the Host first (Claim the Room ID)
+    const peer = new Peer(roomId, {
       debug: 1,
     });
 
     peerRef.current = peer;
 
+    // --- HOST SUCCESS FLOW ---
     peer.on('open', (id) => {
-      console.log('My Peer ID:', id);
-      setPeerState((prev) => ({ ...prev, myId: id, isHost, status: 'ready' }));
+      console.log('Registered as Host with ID:', id);
+      isHostRef.current = true;
+      setPeerState({
+        myId: id,
+        isHost: true,
+        connections: [],
+        status: 'ready',
+      });
+    });
 
-      // If we are a guest, connect to the host immediately
-      if (!isHost && hash) {
-        connectToHost(hash);
+    // --- HOST FAILURE (ALREADY TAKEN) -> BECOME GUEST ---
+    peer.on('error', (err: any) => {
+      if (err.type === 'unavailable-id') {
+        console.log('Room ID taken, joining as Guest...');
+        peer.destroy(); // Destroy the failed host attempt
+        
+        // Create a random guest ID
+        const guestPeer = new Peer({ debug: 1 });
+        peerRef.current = guestPeer;
+
+        guestPeer.on('open', (guestId) => {
+          console.log('Registered as Guest with ID:', guestId);
+          setPeerState(prev => ({ ...prev, myId: guestId, isHost: false }));
+          
+          // Connect to the Room Host
+          const conn = guestPeer.connect(roomId, { reliable: true });
+          
+          conn.on('open', () => {
+            console.log('Connected to Host');
+            connectionsRef.current[roomId] = conn;
+            setPeerState(prev => ({ 
+              ...prev, 
+              status: 'ready',
+              connections: [roomId] 
+            }));
+          });
+
+          conn.on('data', (data) => handleData(data, roomId));
+          
+          conn.on('close', () => {
+            console.log('Host disconnected');
+            setPeerState(prev => ({ ...prev, status: 'error', connections: [] }));
+          });
+          
+          conn.on('error', (e) => console.error('Connection error:', e));
+        });
+
+      } else {
+        console.error('Peer Error:', err);
+        setPeerState(prev => ({ ...prev, status: 'error' }));
       }
     });
 
+    // --- INCOMING CONNECTIONS (Only for Host) ---
     peer.on('connection', (conn) => {
-      handleConnection(conn);
+      console.log('Incoming connection from:', conn.peer);
+      
+      conn.on('open', () => {
+        connectionsRef.current[conn.peer] = conn;
+        setPeerState(prev => ({
+          ...prev,
+          connections: Object.keys(connectionsRef.current)
+        }));
+      });
+
+      conn.on('data', (data) => handleData(data, conn.peer));
+
+      conn.on('close', () => {
+        delete connectionsRef.current[conn.peer];
+        setPeerState(prev => ({
+          ...prev,
+          connections: Object.keys(connectionsRef.current)
+        }));
+      });
     });
 
-    peer.on('error', (err) => {
-      console.error('Peer error:', err);
-      // If ID is taken (rare with random generation) or network fail
-      setPeerState((prev) => ({ ...prev, status: 'error' }));
-    });
-
-    // Cleanup
     return () => {
       peer.destroy();
-      peerRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const connectToHost = (hostId: string) => {
-    if (!peerRef.current) return;
-    const conn = peerRef.current.connect(hostId, {
-      reliable: true,
-    });
-    handleConnection(conn);
-  };
-
-  const handleConnection = (conn: DataConnection) => {
-    conn.on('open', () => {
-      console.log('Connected to:', conn.peer);
-      connectionsRef.current[conn.peer] = conn;
-      
-      setPeerState((prev) => ({
-        ...prev,
-        connections: Object.keys(connectionsRef.current),
-      }));
-
-      // If I am the host, I should sync history or welcome the user (optional)
-      // For simplicity, we just start chatting.
-    });
-
-    conn.on('data', (data: unknown) => {
-      const payload = data as NetworkPayload;
-      
-      if (payload.type === 'CHAT_MESSAGE') {
-        const msg = payload.payload as Message;
-        
-        // If we haven't seen this message, add it
-        if (!processedMessageIds.current.has(msg.id)) {
-          addMessage({ ...msg, isSelf: false });
-
-          // RELAY LOGIC:
-          // If I am the Host, I must broadcast this message to all other connected clients
-          // so that Client B sees what Client C sent.
-          if (peerRef.current && window.location.hash.includes(peerRef.current.id)) {
-             // Broadcast to everyone EXCEPT the sender
-             Object.values(connectionsRef.current).forEach(c => {
-               if (c.peer !== conn.peer && c.open) {
-                 c.send(payload);
-               }
-             });
-          }
-        }
-      }
-    });
-
-    conn.on('close', () => {
-      console.log('Connection closed:', conn.peer);
-      delete connectionsRef.current[conn.peer];
-      setPeerState((prev) => ({
-        ...prev,
-        connections: Object.keys(connectionsRef.current),
-      }));
-    });
-  };
+  }, [addMessage, handleData]);
 
   const sendMessage = (text: string) => {
     if (!text.trim()) return;
 
     const newMessage: Message = {
-      id: generateId(),
+      id: Math.random().toString(36).substr(2, 9),
       text,
       senderId: peerState.myId,
       timestamp: Date.now(),
@@ -158,7 +183,6 @@ export const useP2PChat = () => {
 
     addMessage(newMessage);
     
-    // Broadcast to everyone connected
     sendData({
       type: 'CHAT_MESSAGE',
       payload: newMessage,
